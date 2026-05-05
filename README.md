@@ -1,259 +1,205 @@
-# PolinRider scanners
+# IOC Blocking Toolkit
 
-Cross-platform IOC scanners for the **PolinRider** supply-chain campaign — a DPRK
-(Lazarus) operation that injects obfuscated JavaScript into developers' build-config
-files (`tailwind.config.js`, `postcss.config.mjs`, `vite.config.js`, etc.), drops
-fake `.woff2` payloads, and weaponizes `.vscode/tasks.json` with `runOn: folderOpen`
-to deliver the **Beavertail** Stage-4 credential stealer.
+Cross-platform scripts that prevent the EtherHiding-style malware described in
+`malware-investigation.md` from reaching its command-and-control (C2)
+infrastructure. Works on Linux, macOS, and Windows.
 
-Background: <https://github.com/OpenSourceMalware/PolinRider> · <https://opensourcemalware.com/blog/polinrider-attack>
+## What this does
 
-## Files
+The malware reads its second-stage payload from transactions on the TRON and
+BSC public blockchains, fetched via well-known public RPC endpoints. If it
+can't resolve those endpoints, the second stage cannot execute, and the
+infostealer/wallet-drainer behavior is neutralized — even if the obfuscated
+loader is still sitting in your `tailwind.config.js`.
+
+The scripts:
+
+1. Add `0.0.0.0` entries to the system `hosts` file for every domain in
+   `iocs.txt` (covers IPv4 and IPv6).
+2. Add outbound block rules to the system firewall for every IP in
+   `iocs.txt` (nftables/iptables/ufw on Linux, pf on macOS,
+   Windows Defender Firewall on Windows).
+3. Flush the DNS cache so the changes take effect immediately.
+4. Are fully reversible — re-run with `--unblock` (or `-Unblock` on Windows)
+   to remove everything.
+5. Are idempotent — re-running `block` does not duplicate entries.
+6. Always back up the hosts file with a timestamped suffix before modifying.
+
+## Files in this folder
 
 | File | Purpose |
 |---|---|
-| `check-polinrider-mac.sh` | macOS scanner (bash) |
-| `check-polinrider-linux.sh` | Linux scanner (bash) |
-| `check-polinrider-windows.ps1` | Windows scanner (PowerShell 5.1+) |
-| `decoded-malware-analysis.js.do_not_execute` | Reference decoder for the v1 obfuscator. **Do not run.** Reading-only. |
+| `iocs.txt` | The single source of truth for what to block. Edit freely. |
+| `block-iocs.sh` | Linux + macOS blocking script. |
+| `block-iocs.ps1` | Windows blocking script (PowerShell 5.1+). |
+| `check-polinrider-linux.sh` | Pre-existing detection scan for Linux. |
+| `check-polinrider-mac.sh` | Pre-existing detection scan for macOS. |
+| `check-polinrider-windows.ps1` | Pre-existing detection scan for Windows. |
+| `decoded-malware-analysis.js.do_not_execute` | Annotated deobfuscated payload — analysis only, never run. |
+| `malware-investigation.md` | Full first-person narrative of how this was discovered and traced. |
+| `README.md` | This file. |
 
-## Usage
+The `check-polinrider-*` scripts and `block-iocs.*` scripts are complementary:
+run the `check-` scripts to find infections; run the `block-` scripts to
+prevent any remaining infection from reaching its C2.
 
-**macOS / Linux:**
+## Quick start
+
+### Linux / macOS
 
 ```bash
-bash check-polinrider-mac.sh                       # scans ~/Documents/GitHub
-bash check-polinrider-mac.sh --repos ~/code        # custom repo root
-sudo -A bash check-polinrider-mac.sh --full        # adds unified-log search
+cd /Users/johngarfield/Documents/GitHub/polinrider     # or wherever you cloned this
+chmod +x block-iocs.sh
+sudo ./block-iocs.sh                       # block (default)
+sudo ./block-iocs.sh --dry-run             # show what would happen
+sudo ./block-iocs.sh --hosts-only          # skip firewall, just hosts file
+sudo ./block-iocs.sh --unblock             # remove everything this script added
 ```
 
-**Windows:**
+### Windows
+
+Open PowerShell **as Administrator**, then:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\check-polinrider-windows.ps1
-.\check-polinrider-windows.ps1 -RepoRoot C:\dev -Full   # run elevated for Part C
+cd C:\path\to\polinrider
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\block-iocs.ps1                           # block (default)
+.\block-iocs.ps1 -DryRun                   # show what would happen
+.\block-iocs.ps1 -HostsOnly                # skip firewall
+.\block-iocs.ps1 -Unblock                  # remove everything this script added
 ```
 
-Each script exits `0` if clean, otherwise the hit count.
+## What's in `iocs.txt`
 
-## What gets checked
+Confidence levels are documented inline:
 
-**Part A — Repo payload scan**
-1. JS payload signatures (v1 `rmcej%otb%` and v2 `Cot%3t=shtP`)
-2. Fake `.woff2`/`.woff`/`.ttf` files (wrong magic + JS payload)
-3. Malicious `.vscode/tasks.json` with `runOn: folderOpen`
-4. `.vscode/settings.json` with `task.allowAutomaticTasks: true`
-5. Propagation script names (`temp_auto_push.bat`, `temp_interactive_push.bat`)
-6. Malicious npm dep `tailwindcss-style-animate`
-7. Weaponized take-home UUID `e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9` (StakingGame)
-8. Git history for TZ-mismatched author/committer (server-side amend fingerprint)
+- `[CONFIRMED]` — directly observed in our decoded sample
+  (`decoded-malware-analysis.js.do_not_execute`). Four endpoints carry the
+  entire C2 retrieval chain:
+  - `api.trongrid.io` — primary TRON RPC; the malware reads the latest
+    confirmed outbound transaction from a hardcoded TRON wallet, decodes
+    `raw_data.data` from hex, and reverses the resulting string to obtain
+    a stage-2 transaction hash.
+  - `fullnode.mainnet.aptoslabs.com` — Aptos fallback if the TRON fetch
+    fails; reads `payload.arguments[0]` from the latest tx of a hardcoded
+    Aptos account.
+  - `bsc-dataseed.binance.org` — primary BSC RPC; calls
+    `eth_getTransactionByHash` with the stage-2 hash and decodes the input
+    field's hex into the encrypted payload.
+  - `bsc-rpc.publicnode.com` — BSC RPC fallback.
 
-**Part B — Host execution-evidence scan**
-- Beavertail staging dirs (`{user}${host}_{YYMMDD_HHMMSS}`)
-- Staged credential files (`_credentials.json`, `_sysenv.json`, `_info.json`)
-- Exfil archives (`*${host}_*#{hash}.zip`)
-- Lock file `tmp7A863DD1.tmp`
-- Persistence: LaunchAgents (Mac), systemd/cron/shell-rc (Linux), Run/RunOnce/Scheduled Tasks/WMI (Windows)
-- Live processes / network connections referencing IOCs
-- Browser credential DB and crypto wallet locations (informational)
+  The retrieved payload is XOR-decrypted with one of two hardcoded keys,
+  then either `eval()`'d or executed in a detached `node -e` child process.
 
-**Part C — Deep log search** (`--full`, root/admin)
-- macOS unified log · Linux journalctl · Windows Sysmon + PowerShell ScriptBlock + Defender history
+- `[HIGH]` — same providers, alternate subdomains the attacker can pivot to
+  (TRON Shasta/Nile testnets, BSC mirrors, Aptos testnet/devnet, etc.).
+- `[MEDIUM]` — explorers and APIs commonly used as attribution or fallback
+  C2 (BscScan, Aptos Explorer).
+- `[PRECAUTION]` — defensive blocks; legitimate uses also exist (commented
+  out by default).
 
-## IOCs covered
+Non-blockable IOCs (TRON wallet addresses, Aptos transaction hashes, XOR
+keys, source-code fingerprints) are documented in a comment block at the
+bottom of `iocs.txt` for use in monitoring, blockchain pivoting, and
+yara-style scans of other code bases.
 
-```
-JS variant 1:    rmcej%otb%    seeds 2857687/2667686    decoder _$_1e42
-JS variant 2:    Cot%3t=shtP   seeds 1111436/3896884    decoder MDy
-                 global['!']='8-1638-2'
-Tron addresses:  TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP
-                 TXfxHUet9pJVU1BgVkBAbrES4YUc1nGzcG
-BSC tx hashes:   0xbe037400670fbf1c32364f762975908dc43eeb38759263e7dfcdabc76380811e
-                 0x3f0e5781d0855fb460661ac63257376db1941b2bb522499e4757ecb3ebd5dce3
-C2 IP:           166.88.54.158
-RPC/exfil:       api.trongrid.io  api.telegram.org
-                 bsc-dataseed.binance.org  bsc-rpc.publicnode.com
-Vercel C2:       260120.vercel.app
-                 default-configuration.vercel.app
-                 vscode-{settings-bootstrap,settings-config,bootstrapper,load-config}.vercel.app
-Propagation:     temp_auto_push.bat  temp_interactive_push.bat
-Malicious npm:   tailwindcss-style-animate
-Take-home UUID:  e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9 (StakingGame)
-Lock file:       tmp7A863DD1.tmp
-```
+## When to add IOCs
 
-## Caveats
+Anytime the Cachy investigation, the briefed-agent's `cachy-investigation-report.md`,
+or any future analysis surfaces a new domain or IP, add it to `iocs.txt`
+with the appropriate confidence tag and re-run the script. No code changes
+needed.
 
-- **A clean scan does not prove uninfection.** Beavertail self-cleans its staging
-  directory after a successful exfil; if it ran and finished, there's nothing
-  left to find.
-- IOCs reflect what's *publicly documented* as of 2026-04-11. The campaign
-  rotates fingerprints (v1 → v2 happened in April 2026 in response to the
-  published YARA rule) — re-pull this list periodically against the upstream
-  PolinRider repo.
-- Part B's "running processes" / "open connections" only catch infections that
-  are *currently active*. For historical execution evidence, run `--full` and
-  rely on Part C's log search.
-
-## Blocking the C2 infrastructure
-
-Defense-in-depth: even if a payload runs, blocking outbound traffic to the
-known C2 prevents exfil and second-stage download. Block at two layers —
-**hosts file** (for domains) and **firewall** (for the IP). Re-check upstream
-periodically; the actor rotates infrastructure.
-
-Domains to block:
+Format reminder:
 
 ```
-166.88.54.158                              # raw C2 IP — block at firewall
-api.trongrid.io                            # blockchain dead-drop reads
-bsc-dataseed.binance.org                   # BSC fallback dead-drop
-bsc-rpc.publicnode.com                     # BSC fallback dead-drop
-260120.vercel.app                          # original loader subdomain
-default-configuration.vercel.app           # most-used loader subdomain
-vscode-settings-bootstrap.vercel.app       # TasksJacker bootstrap
-vscode-settings-config.vercel.app          # TasksJacker bootstrap
-vscode-bootstrapper.vercel.app             # TasksJacker bootstrap
-vscode-load-config.vercel.app              # TasksJacker bootstrap
+example.com           # [CONFIRMED] hard-coded in decoded blob
+198.51.100.42         # [CONFIRMED] netstat hit during commit
+not-a-real-c2.org     # [HIGH] from VirusTotal pivot
 ```
 
-Note on `api.telegram.org`: it's the documented exfil endpoint, but it's also
-a legitimate API used by many real apps. Don't blanket-block it unless you're
-certain you don't use any Telegram bots / clients on the host.
+## Verifying it worked
 
-Note on `*.trongrid.io` and `bsc-*`: only block these on machines that don't
-legitimately interact with Tron/BSC blockchains. They're public RPC endpoints
-used by real wallets and dApps.
-
-### macOS
+### Linux / macOS
 
 ```bash
-# Add to /etc/hosts (sudo required)
-sudo tee -a /etc/hosts >/dev/null <<'EOF'
-
-# PolinRider C2 — added YYYY-MM-DD
-0.0.0.0  260120.vercel.app
-0.0.0.0  default-configuration.vercel.app
-0.0.0.0  vscode-settings-bootstrap.vercel.app
-0.0.0.0  vscode-settings-config.vercel.app
-0.0.0.0  vscode-bootstrapper.vercel.app
-0.0.0.0  vscode-load-config.vercel.app
-0.0.0.0  api.trongrid.io
-0.0.0.0  bsc-dataseed.binance.org
-0.0.0.0  bsc-rpc.publicnode.com
-EOF
-
-# Flush DNS cache
-sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
-
-# Block the raw C2 IP via pf
-sudo tee /etc/pf.anchors/polinrider >/dev/null <<'EOF'
-block drop out quick to 166.88.54.158
-block drop in  quick from 166.88.54.158
-EOF
-echo 'anchor "polinrider" all' | sudo tee -a /etc/pf.conf
-echo 'load anchor "polinrider" from "/etc/pf.anchors/polinrider"' | sudo tee -a /etc/pf.conf
-sudo pfctl -f /etc/pf.conf -e
+dig +short api.trongrid.io        # should print 0.0.0.0 (or nothing)
+getent hosts bsc-dataseed.binance.org
+curl -v --max-time 3 https://api.trongrid.io 2>&1 | head    # should fail fast
 ```
 
-### Linux
-
-```bash
-# Add to /etc/hosts (sudo required)
-sudo tee -a /etc/hosts >/dev/null <<'EOF'
-
-# PolinRider C2 — added YYYY-MM-DD
-0.0.0.0  260120.vercel.app
-0.0.0.0  default-configuration.vercel.app
-0.0.0.0  vscode-settings-bootstrap.vercel.app
-0.0.0.0  vscode-settings-config.vercel.app
-0.0.0.0  vscode-bootstrapper.vercel.app
-0.0.0.0  vscode-load-config.vercel.app
-0.0.0.0  api.trongrid.io
-0.0.0.0  bsc-dataseed.binance.org
-0.0.0.0  bsc-rpc.publicnode.com
-EOF
-
-# Flush DNS (varies by distro)
-sudo systemd-resolve --flush-caches 2>/dev/null || sudo resolvectl flush-caches 2>/dev/null || true
-
-# Block the raw C2 IP — nftables (modern systems)
-sudo nft add table inet filter 2>/dev/null || true
-sudo nft 'add chain inet filter output { type filter hook output priority 0; }' 2>/dev/null || true
-sudo nft add rule inet filter output ip daddr 166.88.54.158 drop
-sudo nft add rule inet filter output ip saddr 166.88.54.158 drop
-
-# Or iptables (legacy)
-# sudo iptables -A OUTPUT -d 166.88.54.158 -j DROP
-# sudo iptables -A INPUT  -s 166.88.54.158 -j DROP
-# Persist with iptables-persistent / netfilter-persistent
-```
-
-### Windows (PowerShell, run as Administrator)
+### Windows
 
 ```powershell
-# Append to hosts file
-$hosts = "$env:WINDIR\System32\drivers\etc\hosts"
-$entries = @(
-  '0.0.0.0  260120.vercel.app',
-  '0.0.0.0  default-configuration.vercel.app',
-  '0.0.0.0  vscode-settings-bootstrap.vercel.app',
-  '0.0.0.0  vscode-settings-config.vercel.app',
-  '0.0.0.0  vscode-bootstrapper.vercel.app',
-  '0.0.0.0  vscode-load-config.vercel.app',
-  '0.0.0.0  api.trongrid.io',
-  '0.0.0.0  bsc-dataseed.binance.org',
-  '0.0.0.0  bsc-rpc.publicnode.com'
-)
-Add-Content -Path $hosts -Value "`n# PolinRider C2 — added $(Get-Date -Format 'yyyy-MM-dd')"
-$entries | ForEach-Object { Add-Content -Path $hosts -Value $_ }
-
-# Flush DNS
-ipconfig /flushdns
-
-# Block raw C2 IP via Windows Firewall
-New-NetFirewallRule -DisplayName 'Block PolinRider C2 (out)' `
-  -Direction Outbound -Action Block -RemoteAddress 166.88.54.158 -Profile Any
-New-NetFirewallRule -DisplayName 'Block PolinRider C2 (in)' `
-  -Direction Inbound  -Action Block -RemoteAddress 166.88.54.158 -Profile Any
+Resolve-DnsName api.trongrid.io
+nslookup bsc-dataseed.binance.org
+Test-NetConnection api.trongrid.io -Port 443         # should fail
 ```
 
-### Verifying the blocks
+## What this does NOT do
 
-```bash
-# macOS / Linux — should resolve to 0.0.0.0 or fail
-getent hosts default-configuration.vercel.app    # Linux
-dscacheutil -q host -a name default-configuration.vercel.app   # macOS
+- **Does not remove the malware itself.** The obfuscated payload is still
+  sitting in `cocofintel/frontend/tailwind.config.js` and
+  `SageChat/postcss.config.mjs` (and their git history). Block first, then
+  do the cleanup commits.
+- **Does not protect machines you haven't run it on.** If you have other
+  developer machines / VMs / Codespaces / CI runners, run it there too.
+- **Does not survive a fresh OS install.** Re-run after re-imaging.
+- **Does not replace credential rotation.** You've already revoked the PATs
+  and SSH keys; this is a separate, network-layer mitigation.
+- **Does not catch DoH / DoT.** If your browser or any application is
+  configured to use DNS-over-HTTPS (e.g. Firefox's NextDNS / Cloudflare DoH
+  setting), it bypasses the system resolver and the hosts file entries
+  won't apply to it. The firewall rules will still block by IP. Verify that
+  your browser is using the system resolver if you want hosts-level
+  protection there.
 
-# Should refuse / time out (not 200)
-curl -m 5 -I https://default-configuration.vercel.app/
-curl -m 5 -I http://166.88.54.158/
-```
+## Legitimate-use caveats
 
-```powershell
-# Windows
-Resolve-DnsName default-configuration.vercel.app
-Test-NetConnection 166.88.54.158 -Port 443
-```
+If you actively develop dApps against TRON or BSC, the default `iocs.txt`
+will break that work. Before running, scan the file for `[HIGH]` entries
+and comment out anything that's part of your legitimate stack. The script
+will skip commented lines.
 
-### Network-wide blocking (recommended for shared infrastructure)
+## Reverting
 
-For home/office networks, prefer DNS-level blocking on the resolver instead of
-per-host hosts files — it covers every device and is harder to bypass. Add the
-domains above as a custom blocklist in **Pi-hole**, **AdGuard Home**, **NextDNS**,
-or your router's DNS filtering. Block the IP `166.88.54.158` at the router
-firewall.
+`--unblock` / `-Unblock` does a full clean reversal:
 
-## If a hit is found
+- Removes the hosts-file block delimited by the `# === BEGIN/END ===` markers.
+- Removes nftables `polinrider` table / iptables `polinrider`-tagged rules /
+  ufw `polinrider`-comment rules / pf anchor / Windows Firewall rules in the
+  `polinrider` group.
+- Flushes DNS cache.
 
-1. Stop and **rotate every credential** that lived on the host:
-   browser-saved passwords, cloud keys (`.env`), GitHub PATs, SSH keys,
-   password-manager master password (with 2FA on the vault).
-2. **Crypto wallets**: assume seed phrases / private keys are stolen.
-   Migrate funds to a fresh wallet from a clean device.
-3. Clean the repos (remove the payload, then `git push --force-with-lease`).
-   See the OpenSourceMalware incident-response guide for full host cleanup.
-4. Audit GitHub OAuth apps, GitHub Apps, deploy keys, and webhooks across all
-   your repos — the actor's primary persistence is stolen tokens.
-5. **Block the C2 infrastructure** at host or network level — see above.
+The timestamped hosts backups (`hosts.bak.YYYYMMDD-HHMMSS`) are kept on
+disk in case you want to compare or restore manually.
+
+## Troubleshooting
+
+- **"Permission denied" on `/etc/hosts`** — you forgot `sudo`.
+- **PowerShell "execution of scripts is disabled"** — run
+  `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force` in
+  the same session.
+- **Block doesn't seem to take effect** — flush your browser DNS cache
+  separately (Chrome: `chrome://net-internals/#dns` → Clear host cache).
+- **macOS pf rules vanish after reboot** — pf isn't enabled by default on
+  macOS user systems. The script enables it for the current boot. To make
+  it permanent, look at `launchd` or use only the hosts-file mode (`--hosts-only`).
+- **Linux iptables rules vanish after reboot** — `iptables` rules are not
+  persisted by default. Use `iptables-save > /etc/iptables/rules.v4` (with
+  the `iptables-persistent` package) or run the script from a boot service.
+  nftables rules also do not persist unless you `nft list ruleset > /etc/nftables.conf`.
+
+## Threat-model notes
+
+This is a **defense-in-depth** layer. The right order of operations:
+
+1. ✅ Rotate all credentials (already done).
+2. ✅ Revoke all SSH keys and OAuth tokens (already done).
+3. ✅ Block C2 infrastructure (this toolkit).
+4. ⏳ Identify and remove the local injector (Cachy investigation, in progress).
+5. ⏳ Clean malicious code from infected repos in HEAD (after step 4 completes).
+6. ⏳ Rotate any secrets that were live in those repos at infection time.
+
+Step 3 buys you safety to do steps 4–6 calmly without worrying about
+ongoing exfiltration during the cleanup.

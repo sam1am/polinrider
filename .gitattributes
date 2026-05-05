@@ -1,0 +1,13 @@
+# Force consistent line endings regardless of clone-host platform.
+# PowerShell scripts must be CRLF on Windows; bash/POSIX scripts must be LF.
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Treat the analysis-only JS file as text but never auto-execute conversions
+*.do_not_execute  text eol=lf

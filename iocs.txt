@@ -1,0 +1,129 @@
+# Indicators of Compromise (IOCs) — block list
+#
+# Format:
+#   - Lines starting with `#` are comments and are ignored.
+#   - Blank lines are ignored.
+#   - One indicator per line.
+#   - A line that looks like a domain (e.g. example.com) is added to /etc/hosts as 0.0.0.0.
+#   - A line that looks like an IPv4/IPv6 (e.g. 1.2.3.4 or 2001:db8::1) is added as a firewall rule.
+#   - Optional inline comment after the value separated by whitespace + #.
+#
+# CONFIDENCE LEVELS in comments:
+#   [CONFIRMED]  = directly observed in this malware sample (decoded payload)
+#   [HIGH]       = strongly associated with this malware family / EtherHiding C2 pattern
+#   [MEDIUM]     = commonly abused by similar JS-obfuscator stealers
+#   [PRECAUTION] = blocked defensively; legitimate uses also exist
+#
+# Reference: see decoded-malware-analysis.js.do_not_execute in this folder for
+# the deobfuscated payload showing exactly which endpoints the malware contacts.
+#
+# Edit this file freely. Re-run block-iocs.sh / block-iocs.ps1 to apply changes.
+
+# ===========================================================================
+# CONFIRMED — directly observed in our decoded sample
+# ===========================================================================
+# These four domains are the entire C2 retrieval chain for this malware.
+# Block all four and the second-stage payload cannot be retrieved.
+
+api.trongrid.io                       # [CONFIRMED] primary TRON RPC, fetches tx data from attacker wallet
+fullnode.mainnet.aptoslabs.com        # [CONFIRMED] Aptos fallback for tx hash retrieval
+bsc-dataseed.binance.org              # [CONFIRMED] primary BSC RPC, fetches encrypted payload by tx hash
+bsc-rpc.publicnode.com                # [CONFIRMED] BSC fallback RPC
+
+# ===========================================================================
+# HIGH — same providers, alt subdomains the attacker may pivot to
+# ===========================================================================
+# TRON
+api.shasta.trongrid.io                # [HIGH] TRON Shasta testnet
+api.nileex.io                         # [HIGH] TRON Nile testnet RPC
+nile.trongrid.io                      # [HIGH] TRON Nile via TronGrid
+trongrid.io                           # [HIGH] parent domain
+tronstack.io                          # [HIGH] alt TRON RPC
+tronscan.org                           # [HIGH] explorer used for tx lookup
+api.tronscan.org                      # [HIGH]
+tronscanapi.com                       # [HIGH]
+apilist.tronscanapi.com               # [HIGH]
+
+# Aptos
+fullnode.testnet.aptoslabs.com        # [HIGH] Aptos testnet
+fullnode.devnet.aptoslabs.com         # [HIGH] Aptos devnet
+api.mainnet.aptoslabs.com             # [HIGH]
+api.testnet.aptoslabs.com             # [HIGH]
+indexer.mainnet.aptoslabs.com         # [HIGH]
+aptoslabs.com                         # [HIGH] parent
+
+# BSC mirrors and alt-providers
+bsc-dataseed1.binance.org             # [HIGH]
+bsc-dataseed2.binance.org             # [HIGH]
+bsc-dataseed3.binance.org             # [HIGH]
+bsc-dataseed4.binance.org             # [HIGH]
+bsc-dataseed1.defibit.io              # [HIGH]
+bsc-dataseed2.defibit.io              # [HIGH]
+bsc-dataseed3.defibit.io              # [HIGH]
+bsc-dataseed4.defibit.io              # [HIGH]
+bsc-dataseed1.ninicoin.io             # [HIGH]
+bsc-dataseed2.ninicoin.io             # [HIGH]
+bsc-dataseed3.ninicoin.io             # [HIGH]
+bsc-dataseed4.ninicoin.io             # [HIGH]
+data-seed-prebsc-1-s1.binance.org     # [HIGH] BSC testnet
+data-seed-prebsc-2-s1.binance.org     # [HIGH]
+data-seed-prebsc-1-s2.binance.org     # [HIGH]
+data-seed-prebsc-2-s2.binance.org     # [HIGH]
+data-seed-prebsc-1-s3.binance.org     # [HIGH]
+data-seed-prebsc-2-s3.binance.org     # [HIGH]
+publicnode.com                        # [HIGH] parent of confirmed bsc-rpc.publicnode.com
+ethereum-rpc.publicnode.com           # [HIGH] alt chain
+bsc-testnet-rpc.publicnode.com        # [HIGH]
+
+# ===========================================================================
+# MEDIUM — explorers and APIs commonly used as attribution / fallback C2
+# ===========================================================================
+bscscan.com                           # [MEDIUM]
+api.bscscan.com                       # [MEDIUM]
+api-testnet.bscscan.com               # [MEDIUM]
+explorer.aptoslabs.com                # [MEDIUM]
+
+# ===========================================================================
+# PRECAUTION — common stage-2 hosts, also used legitimately
+# Uncomment if you are confident you don't rely on them.
+# ===========================================================================
+# pastebin.com                        # [PRECAUTION] common stage-2 host
+# rentry.co                           # [PRECAUTION]
+# transfer.sh                         # [PRECAUTION]
+
+# ===========================================================================
+# Add anything else discovered. Examples below — uncomment / replace
+# with real IOCs from forensic findings on Cachy:
+# ===========================================================================
+# evil-c2.example.com                 # [CONFIRMED] from decoded payload
+# 198.51.100.42                       # [CONFIRMED] exfil IP seen in netstat
+
+
+# ===========================================================================
+# NON-BLOCKABLE IOCs — listed here for documentation and monitoring only.
+# These cannot be blocked at the network layer because they're blockchain
+# state, not network endpoints. Use them to:
+#   - Search wallet/explorer activity for related campaigns
+#   - Detect this malware in other code samples
+#   - Pivot to additional infrastructure via blockchain analysis
+# ===========================================================================
+#
+# TRON wallet addresses (storing transaction hashes that point to encrypted payloads):
+#   TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP    # primary, eval() payload
+#   TXfxHUet9pJVU1BgVkBAbrES4YUc1nGzcG    # secondary, child_process payload
+#
+# Aptos transaction hashes (fallback payload pointers):
+#   0xbe037400670fbf1c32364f762975908dc43eeb38759263e7dfcdabc76380811e
+#   0x3f0e5781d0855fb460661ac63257376db1941b2bb522499e4757ecb3ebd5dce3
+#
+# XOR decryption keys (specific to this sample's payload pair):
+#   2[gWfGj;<:-93Z^C        # decrypts eval() payload
+#   m6:tTh^D)cBz?NM]        # decrypts child_process payload
+#
+# Source-code fingerprints to grep across other repos / file systems:
+#   global['!']='8-1638-2'
+#   _$_1e42
+#   "rmcej%otb%",2857687
+#   global['r'] = require; global['m'] = module;
+#   temp_auto_push.bat        (filename in .gitignore — behavioral fingerprint)
+#   temp_interactive_push.bat (filename in .gitignore — behavioral fingerprint)
