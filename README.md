@@ -69,6 +69,110 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\block-iocs.ps1 -Unblock                  # remove everything this script added
 ```
 
+## Scanning for infection (`check-polinrider-*`)
+
+The `check-polinrider-*` scripts are read-only detection scanners. They never
+modify your system — they only report findings. Run one **before** blocking to
+see whether any host or repo is already infected, and again afterward to
+confirm cleanup.
+
+Each script is self-contained: pick the one that matches your OS.
+
+### Linux / macOS
+
+```bash
+bash check-polinrider-mac.sh                          # quick scan, default repo paths
+bash check-polinrider-linux.sh --repos ~/code         # scan a specific repo root
+sudo -A bash check-polinrider-mac.sh --full           # add deep system-log scan
+```
+
+| Argument | Description |
+|---|---|
+| `--repos PATH` | Override the default repo-root list with a single path. Without it, the macOS script scans `~/Documents/GitHub`; the Linux script scans `~/code`, `~/src`, `~/projects`, `~/dev`, `~/git`, `~/repos`, `~/Documents/GitHub`. |
+| `--full` | Adds Part C: deep system-log scan (`log show` on macOS, `journalctl` / iptables logs / `/var/log` on Linux) plus a system-wide process listing. Requires root. |
+
+Exit code is `0` on a clean scan and the hit count otherwise.
+
+### Windows
+
+Open PowerShell (Administrator recommended for Part C):
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\check-polinrider-windows.ps1                                # quick, default repo paths
+.\check-polinrider-windows.ps1 -RepoRoot C:\dev,C:\src        # scan one or more roots
+.\check-polinrider-windows.ps1 -Full                          # add Event Log + system-wide checks
+```
+
+| Argument | Description |
+|---|---|
+| `-RepoRoot <string[]>` | One or more repo roots to scan. Default: `$HOME\Documents\GitHub`, `$HOME\source\repos`, `$HOME\code`, `$HOME\dev`, `$HOME\projects`. |
+| `-Full` | Adds Part C: Sysmon Network Connection (Event ID 3), Process Creation (Event ID 1), PowerShell Script Block Logging (Event ID 4104), and Windows Defender detection history. Run elevated. |
+
+### What the scripts look for
+
+All three platforms share the same IOC set and section layout:
+
+**Part A — repo payload scan**
+- JS payload signatures for both known variants: V1 (`rmcej%otb%`,
+  `global['!']='8-1638-2'`) and V2 (`Cot%3t=shtP`) across `.js`, `.mjs`,
+  `.cjs`, `.ts`, `.tsx`, `.jsx`, `.vue`, `.svelte`.
+- Fake font/asset files: `.woff2` / `.woff` / `.ttf` whose magic bytes don't
+  match the format and whose contents look like JavaScript (`require`,
+  `process.`, `child_process`, or a payload marker).
+- TasksJacker `.vscode/tasks.json` with `runOn: folderOpen` that also
+  references node-loading-a-font, piped curl/wget shell, a known C2 domain,
+  or the weaponized take-home UUID.
+- `.vscode/settings.json` with `task.allowAutomaticTasks: true`.
+- References to the propagation scripts `temp_auto_push.bat` /
+  `temp_interactive_push.bat`.
+- `package.json` files depending on the malicious npm package
+  `tailwindcss-style-animate`.
+- The weaponized take-home UUID `e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9`.
+- Git commits with author/committer timezone mismatch under the same
+  identity (post-commit amend on a different machine — a spoofing
+  fingerprint).
+
+**Part B — host execution-evidence scan**
+- Beavertail staging directories matching `{user}${host}_YYMMDD_HHMMSS`
+  under `~/.npm`, `/tmp`, `/var/tmp`, `~/Library/...` (mac), or `%TEMP%` /
+  `%APPDATA%` (Windows).
+- Staged exfil files: `_credentials.json`, `_sysenv.json`, `_sysenv.env`,
+  `_info.json`.
+- Exfil archives matching `*${host}_*#<hex>.zip`.
+- Known mutex / lock file `tmp7A863DD1.tmp`.
+- Persistence: LaunchAgents/Daemons (mac), systemd user services + cron +
+  XDG autostart + shell rc files (Linux), Run/RunOnce keys + Scheduled
+  Tasks + Startup folder + WMI Event Subscriptions (Windows) — flagged
+  when they reference any IOC.
+- Dropper-shaped files (`*.py`, `*.js`, `*.sh`) modified in the last 180
+  days under `/tmp`, `~/Library`, or `%TEMP%` whose contents reference C2
+  endpoints, the C2 IP `166.88.54.158`, hardcoded TRON wallets, BSC
+  transaction hashes, `portalocker`, the lock-file name, or a payload
+  marker.
+- Running processes loading fonts via node, or matching any C2 domain.
+- Open network connections to the known C2 IP, Vercel C2 hostnames, or
+  the blockchain RPC endpoints.
+- Shell / PowerShell history mentioning any IOC.
+- Browser credential DB last-modified timestamps (informational, helps you
+  decide what to rotate).
+- Installed crypto wallet directories (informational).
+- macOS only: keychain-access events from `node`, `python`, `curl`, or
+  `wget` in the last 7 days.
+
+**Part C — deep system-log scan (`--full` / `-Full`)**
+- macOS: unified log search (`log show --last 14d`) for any IOC string,
+  full process list, and pf state table for the C2 IP.
+- Linux: `journalctl` search, full process list, iptables/nftables logs,
+  and `/var/log` grep.
+- Windows: Sysmon Event IDs 3 (network) and 1 (process), PowerShell Event
+  ID 4104 (script block logging), and Defender detection history.
+
+Findings are tagged `HIT` (confirmed match), `REVIEW` (needs a human look),
+or `ok` (clean). A clean scan does not prove uninfection — Beavertail
+variants are known to self-clean after exfil — so re-run periodically and
+keep `iocs.txt` blocked at the network layer regardless.
+
 ## What's in `iocs.txt`
 
 Confidence levels are documented inline:
