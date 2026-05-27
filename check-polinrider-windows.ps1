@@ -37,6 +37,8 @@ $C2_RPC     = "api\.trongrid\.io|api\.telegram\.org|bsc-dataseed\.binance\.org|b
 $Propagation = "temp_auto_push\.bat|temp_interactive_push\.bat"
 $EvilNpm    = "tailwindcss-style-animate"
 $EvilUuid   = "e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9"
+$FaSolidWoff2 = "fa-solid-400\.woff2|public[/\\]fonts[/\\]fa-solid-400\.woff2"
+$TasksJackerCmd = "node\s+(\./)?public[/\\]fonts[/\\]fa-solid-400\.woff2"
 $NpmDirRe   = '^[\w._-]+\$[\w._-]+_\d{6}_\d{6}$'
 $ExfilZipRe = '\$[\w._-]+_\d{6}_\d{6}(_2)?#[a-f0-9]{6,}\.zip$'
 
@@ -88,6 +90,26 @@ foreach ($root in $RepoRoot) {
 }
 if (-not $found) { Ok "no fake fonts" }
 
+Sub "A2b. PolinRider canonical fake font (public/fonts/fa-solid-400.woff2)"
+$found = $false
+foreach ($root in $RepoRoot) {
+    if (-not (Test-Path $root)) { continue }
+    Get-ChildItem -Path $root -Recurse -Force -Filter "fa-solid-400.woff2" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '[/\\]public[/\\]fonts[/\\]fa-solid-400\.woff2$' -and $_.FullName -notmatch '\\node_modules\\' } |
+        ForEach-Object {
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            $hex = if ($bytes.Length -ge 4) { ($bytes[0..3] | ForEach-Object { $_.ToString('x2') }) -join '' } else { '' }
+            if ($hex -ne '774f4632') {
+                $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+                if ($content -match "$V1_Marker|$V2_Marker|$V1_Global|rmcej") {
+                    Hit "$($_.FullName) (PolinRider fake fa-solid-400.woff2; magic=$hex)"
+                    $found = $true
+                }
+            }
+        }
+}
+if (-not $found) { Ok "no PolinRider fa-solid-400.woff2 payload file" }
+
 Sub "A3. Malicious .vscode/tasks.json with auto-execute (TasksJacker)"
 $found = $false
 foreach ($root in $RepoRoot) {
@@ -106,6 +128,19 @@ foreach ($root in $RepoRoot) {
         }
 }
 if (-not $found -and $script:Warns -eq 0) { Ok "no folderOpen auto-tasks" }
+
+Sub "A3b. TasksJacker canonical node-on-woff2 command"
+$found = $false
+foreach ($root in $RepoRoot) {
+    if (-not (Test-Path $root)) { continue }
+    Get-ChildItem -Path $root -Recurse -Force -Filter "tasks.json" -ErrorAction SilentlyContinue |
+        Where-Object { $_.DirectoryName -match '\\\.vscode$' -and $_.FullName -notmatch '\\node_modules\\' } |
+        ForEach-Object {
+            $c = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+            if ($c -match $TasksJackerCmd) { Hit $_.FullName; $found = $true }
+        }
+}
+if (-not $found) { Ok "no canonical TasksJacker command in tasks.json" }
 
 Sub "A4. .vscode/settings.json with task.allowAutomaticTasks:true"
 $found = $false
@@ -133,6 +168,20 @@ foreach ($root in $RepoRoot) {
         ForEach-Object { Hit $_.Path; $found = $true }
 }
 if (-not $found) { Ok "no propagation refs" }
+
+Sub "A5b. .gitignore PolinRider artifacts (bat ignores + self-reference)"
+$found = $false
+foreach ($root in $RepoRoot) {
+    if (-not (Test-Path $root)) { continue }
+    Get-ChildItem -Path $root -Recurse -Force -Filter ".gitignore" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\node_modules\\' } |
+        ForEach-Object {
+            $lines = Get-Content $_.FullName -ErrorAction SilentlyContinue
+            if ($lines -match '^\s*\.gitignore\s*$') { Hit "$($_.FullName) lists .gitignore (PolinRider artifact)"; $found = $true }
+            if ($lines -match '^\s*temp_auto_push\.bat\s*$') { Hit "$($_.FullName) lists temp_auto_push.bat"; $found = $true }
+        }
+}
+if (-not $found) { Ok "no PolinRider .gitignore artifact lines" }
 
 Sub "A6. Malicious npm package '$EvilNpm' in package.json"
 $found = $false
