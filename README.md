@@ -35,6 +35,7 @@ The scripts:
 | `check-polinrider-linux.sh` | Pre-existing detection scan for Linux. |
 | `check-polinrider-mac.sh` | Pre-existing detection scan for macOS. |
 | `check-polinrider-windows.ps1` | Pre-existing detection scan for Windows. |
+| `clean-polinrider-repo.sh` | Removes PolinRider `.vscode/` + `public/fonts/` injection via `git rm` only (never executes payloads). |
 | `decoded-malware-analysis.js.do_not_execute` | Annotated deobfuscated payload — analysis only, never run. |
 | `malware-investigation.md` | Full first-person narrative of how this was discovered and traced. |
 | `README.md` | This file. |
