@@ -41,6 +41,11 @@ C2_RPC='api\.trongrid\.io|api\.telegram\.org|bsc-dataseed\.binance\.org|bsc-rpc\
 PROPAGATION='temp_auto_push\.bat|temp_interactive_push\.bat'
 EVIL_NPM='tailwindcss-style-animate'
 EVIL_UUIDS='e9b53a7c-2342-4b15-b02d-bd8b8f6a03f9'
+
+# PolinRider VS Code / fake-font vector (TasksJacker)
+FA_SOLID_WOFF2_RE='public/fonts/fa-solid-400.woff2|fa-solid-400.woff2'
+TASKSJACKER_CMD_RE='node[[:space:]]+(./)?public/fonts/fa-solid-400.woff2'
+
 NPM_DIR_RE='[a-zA-Z0-9._-]+\$[a-zA-Z0-9._-]+_[0-9]{6}_[0-9]{6}'
 EXFIL_ZIP_RE='\$[a-zA-Z0-9._-]+_[0-9]{6}_[0-9]{6}(_2)?#[a-f0-9]{6,}\.zip$'
 
@@ -81,6 +86,20 @@ for root in "${REPO_ROOTS[@]}"; do
            -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/venv/*" 2>/dev/null)
 done
 [ "$found" = 0 ] && ok "no fake font files"
+
+
+sub "A2b. PolinRider canonical fake font (public/fonts/fa-solid-400.woff2)"
+found=0
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  magic=$(head -c 4 "$f" 2>/dev/null | xxd -p)
+  if ! echo "$magic" | grep -qE "^774f4632$"; then
+    if grep -qE "$V1_MARKER|$V2_MARKER|$V1_GLOBAL|$TASKSJACKER_CMD_RE|rmcej" "$f" 2>/dev/null || [ "$(file -b "$f" 2>/dev/null)" = "ASCII text" ]; then
+      hit "$f (PolinRider fake fa-solid-400.woff2; magic=$magic)"; found=1
+    fi
+  fi
+done < <(grep -E "fa-solid-400\.woff2$" "$INV" 2>/dev/null || find "${REPO_ROOTS[@]}" -path "*/public/fonts/fa-solid-400.woff2" 2>/dev/null)
+[ "$found" = 0 ] && ok "no PolinRider fa-solid-400.woff2 payload file"
 
 sub "A3. Malicious .vscode/tasks.json with auto-execute (TasksJacker)"
 found=0
