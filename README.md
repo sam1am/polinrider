@@ -35,6 +35,8 @@ The scripts:
 | `check-polinrider-linux.sh` | Pre-existing detection scan for Linux. |
 | `check-polinrider-mac.sh` | Pre-existing detection scan for macOS. |
 | `check-polinrider-windows.ps1` | Pre-existing detection scan for Windows. |
+| `canary-watch.sh` | Headless cron/systemd watcher for remote GitHub force-pushes by untrusted actors. |
+| `canary-sentinel.sh` | **Live full-screen monitoring console** — continuous remote repo surveillance + periodic local signature scanning with a loud intrusion alarm. |
 | `clean-polinrider-repo.sh` | Removes PolinRider `.vscode/` + `public/fonts/` injection via `git rm` only (never executes payloads). |
 | `decoded-malware-analysis.js.do_not_execute` | Annotated deobfuscated payload — analysis only, never run. |
 | `malware-investigation.md` | Full first-person narrative of how this was discovered and traced. |
@@ -173,6 +175,50 @@ Findings are tagged `HIT` (confirmed match), `REVIEW` (needs a human look),
 or `ok` (clean). A clean scan does not prove uninfection — Beavertail
 variants are known to self-clean after exfil — so re-run periodically and
 keep `iocs.txt` blocked at the network layer regardless.
+
+## Continuous monitoring (`canary-sentinel.sh`)
+
+`canary-sentinel.sh` is a live, full-screen "mission control" console that
+runs forever and watches for PolinRider on two fronts at once:
+
+- **Remote surveillance** — polls the GitHub *repository activity* API for
+  every watched repo and raises an alarm on any force-push (the PolinRider
+  attack signature) or any push / branch / PR-merge by an untrusted actor.
+- **Local signature scan** — re-scans your machine on an interval for payload
+  markers, trojaned `fa-solid-400.woff2` fonts, malicious `.vscode/tasks.json`
+  auto-tasks, `temp_*_push.bat` droppers, the malicious npm dependency, rogue
+  `node` processes, live C2 network connections, and rogue launch agents.
+
+The moment anything is detected the **threat level** escalates and a
+screen-filling, blinking, bell-ringing **INTRUSION DETECTED** banner appears.
+
+```bash
+chmod +x canary-sentinel.sh
+./canary-sentinel.sh                      # launch the live console
+./canary-sentinel.sh --repos ~/code       # scan repos under a custom root
+./canary-sentinel.sh --once               # one headless sweep (cron/CI; exit code = # critical hits)
+./canary-sentinel.sh --demo               # inject a fake hit to preview the alarm
+```
+
+Keys while running: `q` quit · `p` pause/resume · `r` remote sweep now ·
+`l` local scan now · `a` acknowledge the alarm.
+
+It shares config and alert channels with `canary-watch.sh`:
+
+| Env var | Effect |
+|---|---|
+| `SENTINEL_REMOTE_INTERVAL` | Seconds between remote sweeps (default 300). |
+| `SENTINEL_LOCAL_INTERVAL` | Seconds between local scans (default 120). |
+| `CANARY_REPOS` / `CANARY_REPO_FILE` | Override the watched-repo list. |
+| `CANARY_TRUSTED_ACTORS` | Actors whose pushes are *not* alerted on. |
+| `CANARY_NTFY_TOPIC` | Push to `ntfy.sh/<topic>` (free, phone-friendly). |
+| `CANARY_DISCORD_URL` / `CANARY_SLACK_URL` | Webhook fan-out. |
+| `CANARY_NATIVE=1` | Desktop notification (`osascript` / `notify-send`). |
+
+Remote surveillance needs `gh` authenticated (`gh auth login`) and `jq`; the
+local scan works without them. Requires bash and a terminal at least 70×20.
+For a fully headless deployment (no TUI) use `canary-watch.sh` under cron or a
+systemd timer instead — see the comments at the end of that script.
 
 ## What's in `iocs.txt`
 
