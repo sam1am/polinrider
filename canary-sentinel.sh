@@ -23,6 +23,19 @@
 #   bash canary-sentinel.sh --repos ~/code  # scan repos under a custom root
 #   bash canary-sentinel.sh --once          # single headless sweep (cron/CI)
 #   bash canary-sentinel.sh --demo          # inject a fake hit to see the alarm
+#   bash canary-sentinel.sh --no-branches   # skip per-branch tree content scan
+#   bash canary-sentinel.sh --no-map        # skip the global threat-map panel
+#
+# REMOTE SCAN COVERAGE
+#   For every watched repo we now sweep:
+#     • the GitHub repository ACTIVITY stream (force-push / push by untrusted
+#       actor / branch creation / PR merge), as before, AND
+#     • the TIP CONTENT of EVERY branch — fetching its tree, picking out the
+#       known PolinRider payload paths (fa-solid-400.woff2, .vscode/tasks.json,
+#       temp_*_push.bat, package.json) and grepping the raw blob for V1/V2,
+#       C2 hosts, exfil wallets, and the malicious npm dep. A branch's SHA is
+#       cached so unchanged branches are scanned exactly once per session —
+#       this is what would have caught the dormant backlogia `dev` branch.
 #
 # KEYS (while running)
 #   q  quit       p  pause/resume sweeps     r  remote sweep now
@@ -70,6 +83,8 @@ REPO_ROOTS=("$HOME/Documents/GitHub")
 MODE="tui"          # tui | once
 DEMO=0
 NOCOLOR=0
+SCAN_BRANCHES="${SENTINEL_SCAN_BRANCHES:-1}"   # 0=skip per-branch content sweep
+SHOW_MAP="${SENTINEL_SHOW_MAP:-1}"             # 0=hide world-map panel even on tall terms
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -77,9 +92,11 @@ while [ $# -gt 0 ]; do
     --once)  MODE="once"; shift ;;
     --demo)  DEMO=1; shift ;;
     --no-color) NOCOLOR=1; shift ;;
+    --no-branches) SCAN_BRANCHES=0; shift ;;
+    --no-map)      SHOW_MAP=0; shift ;;
     --remote-interval) shift; REMOTE_INTERVAL="$1"; shift ;;
     --local-interval)  shift; LOCAL_INTERVAL="$1"; shift ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) shift ;;
   esac
 done
@@ -124,6 +141,9 @@ R_TRIGGER="$RUN/remote.trigger"
 L_TRIGGER="$RUN/local.trigger"
 SEEN_DIR="$RUN/seen"          ; mkdir -p "$SEEN_DIR"
 SIG_DIR="$RUN/sig"            ; mkdir -p "$SIG_DIR"
+BRANCH_DIR="$RUN/branches"    ; mkdir -p "$BRANCH_DIR"   # per-(repo,branch) SHA cache
+BR_TOTAL_FILE="$RUN/br.total" ; printf '0\n' >"$BR_TOTAL_FILE"
+BR_DIRTY_FILE="$RUN/br.dirty" ; printf '0\n' >"$BR_DIRTY_FILE"
 WORKER_PIDS=()
 
 cleanup() {
@@ -158,17 +178,55 @@ is_trusted() { local a="$1" t; for t in "${TRUSTED[@]}"; do [[ "$a" == "$t" ]] &
 emit() { printf '%s\t%s\t%s\t%s\n' "$(now)" "$1" "$2" "$3" >>"$ALERTS"; }
 
 # ══════════════════════════ REMOTE SURVEILLANCE WORKER ═════════════════════
+# Per-branch content scan. The PolinRider crew has historically planted the
+# payload on a side branch and left it there even when the default branch was
+# "cleaned"; that's the gap that hid backlogia/dev. We now grade EVERY branch
+# tip by walking the tree and grepping suspect blobs for the V1/V2/C2/wallet
+# markers and the malicious npm dep.
+#
+# We cache the last scanned SHA per (repo,branch) for the lifetime of this
+# process so a subsequent sweep only touches the GitHub API for branches that
+# have actually moved. The first sweep is the expensive one.
+SUSPECT_PATH_RE='(fa-(solid|regular|brands|light)-[0-9]+\.(woff2?|ttf|eot)$|(^|/)\.vscode/tasks\.json$|(^|/)temp_(auto|interactive)_push\.bat$|(^|/)package\.json$)'
+
+remote_scan_one_branch() { # repo  branch  sha   -> echoes "hit_paths" or ""
+  local repo="$1" branch="$2" sha="$3"
+  local tree paths path content
+  tree=$(gh api "repos/$repo/git/trees/$sha?recursive=1" 2>/dev/null) || return 0
+  paths=$(echo "$tree" \
+    | jq -r '.tree[]?|select(.type=="blob")|.path' 2>/dev/null \
+    | grep -iE "$SUSPECT_PATH_RE" \
+    | head -12) || true
+  [[ -z "$paths" ]] && return 0
+
+  local hits=""
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    # Url-encode '#' and '?' so paths with them don't break the contents endpoint
+    local enc=${path//\#/%23}; enc=${enc//\?/%3F}
+    content=$(gh api -H "Accept: application/vnd.github.raw" \
+              "repos/$repo/contents/$enc?ref=$sha" 2>/dev/null) || continue
+    [[ -z "$content" ]] && continue
+    # -a = treat binary as text (the trojaned woff2 is ASCII JS anyway)
+    if printf '%s' "$content" | grep -qaE "$ALL_SIG|$EVIL_NPM"; then
+      hits+="${path}; "
+    fi
+  done <<< "$paths"
+  printf '%s' "${hits% }"
+}
+
 remote_check_one() {
   local repo="$1" sf="$SEEN_DIR/${repo//\//__}.last"
   local last=0; [[ -f "$sf" ]] && last=$(cat "$sf" 2>/dev/null || echo 0)
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
   local activity newest=$last code="OK" detail="clean" worst=0
+  local br_total=0 br_dirty=0
 
   if ! activity=$(gh api -X GET "repos/$repo/activity" -F per_page=30 2>&1); then
     if echo "$activity" | grep -q '"Not Found"'; then
-      printf 'SKIP|%s|private or missing|%s\n' "$repo" "$(now)" >>"$R_STATE.tmp"; return
+      printf 'SKIP|%s|private or missing|%s|0|0\n' "$repo" "$(now)" >>"$R_STATE.tmp"; return
     fi
-    printf 'ERR|%s|api error|%s\n' "$repo" "$(now)" >>"$R_STATE.tmp"; return
+    printf 'ERR|%s|api error|%s|0|0\n' "$repo" "$(now)" >>"$R_STATE.tmp"; return
   fi
 
   while IFS=$'\t' read -r t atype actor ref before after; do
@@ -196,7 +254,46 @@ remote_check_one() {
   done < <(echo "$activity" | jq -r '.[]|[.timestamp,.activity_type,.actor.login,(.ref//""),(.before//""),(.after//"")]|@tsv' 2>/dev/null)
 
   echo "$newest" >"$sf"
-  printf '%s|%s|%s|%s\n' "$code" "$repo" "$detail" "$(now)" >>"$R_STATE.tmp"
+
+  # ── per-branch content scan ────────────────────────────────────────────
+  # Catches the dormant-branch case (e.g. backlogia/dev) that the activity
+  # stream alone never surfaced.
+  if [[ "$SCAN_BRANCHES" == 1 ]]; then
+    local br_json
+    if br_json=$(gh api "repos/$repo/branches?per_page=100" --paginate 2>/dev/null); then
+      local branch sha
+      while IFS=$'\t' read -r branch sha; do
+        [[ -z "$branch" || -z "$sha" ]] && continue
+        br_total=$((br_total+1))
+        # Filesystem-safe branch slug for the cache filename
+        local slug; slug=$(printf '%s' "$branch" | tr -c 'A-Za-z0-9._-' '_')
+        local cache="$BRANCH_DIR/${repo//\//__}__${slug}"
+        if [[ -f "$cache.sha" && "$(cat "$cache.sha" 2>/dev/null)" == "$sha" ]]; then
+          [[ -f "$cache.dirty" ]] && br_dirty=$((br_dirty+1))
+          continue
+        fi
+        local hits
+        hits=$(remote_scan_one_branch "$repo" "$branch" "$sha")
+        if [[ -n "$hits" ]]; then
+          emit CRIT "remote:$repo#$branch" "branch malware — $hits"
+          touch "$cache.dirty"
+          br_dirty=$((br_dirty+1))
+        else
+          rm -f "$cache.dirty" 2>/dev/null
+        fi
+        echo "$sha" > "$cache.sha"
+      done < <(echo "$br_json" | jq -r '.[]?|[.name,.commit.sha]|@tsv' 2>/dev/null | head -100)
+    fi
+  fi
+
+  if (( br_dirty > 0 )); then
+    code="CRIT"; worst=2
+    detail="${br_dirty}/${br_total} branch(es) infected"
+  elif (( br_total > 0 )) && [[ "$code" == "OK" ]]; then
+    detail="clean (${br_total}br)"
+  fi
+
+  printf '%s|%s|%s|%s|%s|%s\n' "$code" "$repo" "$detail" "$(now)" "$br_total" "$br_dirty" >>"$R_STATE.tmp"
 }
 
 remote_worker() {
@@ -210,6 +307,9 @@ remote_worker() {
       remote_check_one "$repo"
     done
     mv -f "$R_STATE.tmp" "$R_STATE" 2>/dev/null
+    # publish fleet-wide branch totals for the map/footer
+    awk -F'|' 'BEGIN{t=0;d=0} {t+=$5;d+=$6} END{print t" "d}' "$R_STATE" 2>/dev/null \
+      | { read -r _t _d; printf '%s\n' "${_t:-0}" >"$BR_TOTAL_FILE"; printf '%s\n' "${_d:-0}" >"$BR_DIRTY_FILE"; }
     local next=$(( $(now) + REMOTE_INTERVAL ))
     printf 'idle|%s|%s|\n' "$(now)" "$next" >"$R_META"
     # interruptible sleep
@@ -377,13 +477,19 @@ if [[ "$MODE" == "once" ]]; then
     esac
   done <"$L_STATE"
   if [[ "$REMOTE_ENABLED" == 1 ]]; then
-    echo; echo "── REMOTE (${#REPOS[@]} repos) ──"
+    echo; echo "── REMOTE (${#REPOS[@]} repos, branch-scan=$SCAN_BRANCHES) ──"
     : >"$R_STATE.tmp"
-    for repo in "${REPOS[@]}"; do remote_check_one "$repo"; done
+    for repo in "${REPOS[@]}"; do
+      printf '  · sweeping %s …\n' "$repo" >&2
+      remote_check_one "$repo"
+    done
     mv -f "$R_STATE.tmp" "$R_STATE"
-    awk -F'|' '$1!="OK"&&$1!="SKIP"{print "  ["$1"] "$2" — "$3}' "$R_STATE" || true
+    awk -F'|' '$1!="OK"&&$1!="SKIP"{print "  ["$1"] "$2" — "$3" ("$5"br/"$6"dirty)"}' "$R_STATE" || true
     nonok=$(awk -F'|' '$1!="OK"&&$1!="SKIP"' "$R_STATE" | wc -l | tr -d ' ')
+    br_t=$(awk -F'|' 'BEGIN{s=0}{s+=$5}END{print s}' "$R_STATE")
+    br_d=$(awk -F'|' 'BEGIN{s=0}{s+=$6}END{print s}' "$R_STATE")
     [[ "$nonok" == 0 ]] && echo "  all repos clean"
+    echo "  branches scanned: ${br_t:-0}   infected: ${br_d:-0}"
   else
     echo; echo "── REMOTE ── (disabled: need gh authenticated + jq)"
   fi
@@ -407,6 +513,57 @@ fi
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 PULSE=('░' '▒' '▓' '█' '▓' '▒')
 GL_OK='◉'; GL_WARN='▲'; GL_CRIT='⊗'; GL_PEND='◌'; GL_SKIP='·'; GL_ERR='✕'
+
+# ─── stylised ANSI world map (ASCII art) ──────────────────────────────────
+# Single-quoted rows so backslashes are literal; rows are padded to MAP_W in
+# init_map(). Apostrophes are intentionally replaced by backticks in the art
+# so we never need shell-escape gymnastics inside the array.
+MAP=(
+'       __         ___                       ___          '
+'    .-/  \____,-`EUR \____      _.--`---. AS\____        '
+'   /  N.AM   .    EUROPE  \,---`    .--`  ASIA  \    JP\ '
+'  /    USA   `,            \              .        \  ,-`'
+'  \           \,            \   ,-,   ,--`         /,`  '
+'   `,    ,--,  \,---._   ,--`  /   \,-`    ,---,--`     '
+'     \,-`    \  /     \,-`    /    AFRICA      \,_,-`    '
+'      | S.A. / /              `,             ,`         '
+'       \,__,` /                 `--._   _,--`            '
+'                                     `-`            ___ '
+'                                                 ,-` AU\ '
+)
+MAP_W=56; MAP_H=11
+
+init_map(){
+  local i mx=0
+  for ((i=0; i<${#MAP[@]}; i++)); do (( ${#MAP[$i]} > mx )) && mx=${#MAP[$i]}; done
+  (( mx > MAP_W )) && MAP_W=$mx
+  for ((i=0; i<${#MAP[@]}; i++)); do
+    while (( ${#MAP[$i]} < MAP_W )); do MAP[$i]+=' '; done
+  done
+  MAP_H=${#MAP[@]}
+}
+init_map
+
+# overlay coords are (row col) inside the MAP[][] frame (0-indexed).
+# C2 endpoints we have IOCs for — pinned roughly to physical infrastructure
+# they fly out of. Always rendered red; on CRITICAL they invert/blink.
+C2_DOTS=(
+  '2 5'    # Vercel hosts (vscode-bootstrapper etc.) — US west
+  '2 11'   # 166.88.54.158 ColoCrossing, Cleveland OH
+  '2 28'   # api.telegram.org — UK/NL edge
+  '3 32'   # bsc-dataseed.binance.org — central EU edge
+  '4 44'   # api.trongrid.io — Singapore
+)
+# Repo activity beacons — cycle through these as the radar sweeps
+REPO_DOTS=(
+  '2 8'    # sam1am repos (rough US-Mountain)
+  '3 9'
+  '2 14'
+  '3 25'   # EU
+  '2 42'   # JP/Asia
+  '6 38'   # AF
+  '9 49'   # AU
+)
 
 # ---- terminal -------------------------------------------------------------
 W=80; H=24
@@ -576,23 +733,41 @@ draw(){
   at 7 1; FB+="${tcol}▌${RST}"; at 7 "$W"; FB+="${tcol}▐${RST}"
 
   # ── PANELS LAYOUT ───────────────────────────────────────────────────
-  local ptop=9
-  local feed_h=8
-  local pbot=$(( H - feed_h - 2 ))
-  local pheight=$(( pbot - ptop ))
+  local ptop=9 feed_h map_h pheight show_map=0
+  # Show the world-map panel only when the user wants it AND the terminal is
+  # tall enough that the top panels still get a usable amount of space.
+  if [[ "$SHOW_MAP" == 1 ]] && (( H >= 33 )); then
+    show_map=1
+    feed_h=4
+    map_h=$(( (H - 20) / 2 ))
+    (( map_h < 11 )) && map_h=11
+    (( map_h > 15 )) && map_h=15
+    pheight=$(( H - ptop - map_h - feed_h - 3 ))
+    (( pheight < 5 )) && pheight=5
+  else
+    feed_h=8
+    pheight=$(( H - feed_h - 2 - ptop ))
+  fi
+
   local lw2=$(( mid - 2 ))            # left panel width
   local lc1=2                          # left panel col
   local rc1=$(( mid + 1 ))            # right panel col
   local rw2=$(( W - rc1 ))            # right panel width
   (( rw2 < 10 )) && rw2=10
 
-  # ---- LEFT: REMOTE SURVEILLANCE ----
   draw_remote "$ptop" "$lc1" "$lw2" "$pheight"
-  # ---- RIGHT: LOCAL SIGNATURE SCAN ----
-  draw_local "$ptop" "$rc1" "$rw2" "$pheight"
+  draw_local  "$ptop" "$rc1" "$rw2" "$pheight"
 
-  # ── ALERT FEED (bottom) ─────────────────────────────────────────────
-  local ftop=$(( H - feed_h - 1 ))
+  # ── WORLD MAP (full width, between panels and feed) ─────────────────
+  local ftop
+  if (( show_map )); then
+    local mtop=$(( ptop + pheight + 1 ))
+    draw_map "$mtop" 2 "$((W-2))" "$map_h"
+    ftop=$(( mtop + map_h + 1 ))
+  else
+    ftop=$(( H - feed_h - 1 ))
+  fi
+
   draw_feed "$ftop" 2 "$((W-2))" "$feed_h"
 
   # ── FOOTER ──────────────────────────────────────────────────────────
@@ -663,9 +838,16 @@ draw_remote(){
   local shown=0
   for row in ${rows[@]+"${rows[@]}"}; do
     (( shown>=lines_avail )) && break
-    IFS='|' read -r code repo detail rest <<<"$row"
+    # 6-field row: CODE|repo|detail|ts|br_total|br_dirty   (older 4-field demos still work)
+    IFS='|' read -r code repo detail _ts br_t br_d <<<"$row"
     local g col; g=$(sev_glyph "$code"); col=$(sev_color "$code")
-    at $((r+i+shown)) "$c"; FB+="${FRAME}│${RST} ${col}${g}${RST} ${TXT}$(fit "${repo#*/}" $((w-21)))${RST} ${DIM}$(fit "$detail" 14)${RST} ${FRAME}│${RST}"
+    # Right cell prefers a concise branch summary when the repo is clean; for
+    # CRIT/WARN rows we keep the activity/branch-hit detail intact.
+    local right="$detail"
+    if [[ "$code" == "OK" && "${br_t:-0}" =~ ^[0-9]+$ && "${br_t:-0}" -gt 0 ]]; then
+      right="${br_t}br ✓"
+    fi
+    at $((r+i+shown)) "$c"; FB+="${FRAME}│${RST} ${col}${g}${RST} ${TXT}$(fit "${repo#*/}" $((w-21)))${RST} ${col}$(fit "$right" 14)${RST} ${FRAME}│${RST}"
     shown=$((shown+1))
   done
   for ((;shown<lines_avail;shown++)); do iline $((r+i+shown)) "$c" "$w" "$FRAME" "$DIM" ""; done
@@ -703,6 +885,114 @@ draw_local(){
   fi
   for ((;shown<lines_avail;shown++)); do iline $((r+i+shown)) "$c" "$w" "$FRAME" "$DIM" ""; done
   box_bot $((r+h)) "$c" "$w" "$FRAME"
+}
+
+draw_map(){
+  local r=$1 c=$2 w=$3 h=$4
+  local title="GLOBAL THREAT MAP"
+  [[ "$THREAT" == CRITICAL ]] && title="GLOBAL THREAT MAP  ◆  EXFIL IN PROGRESS"
+  local titlecol="$FRAME"
+  [[ "$THREAT" == CRITICAL ]] && (( TICK%2 )) && titlecol="$CRITc"
+  box_top "$r" "$c" "$w" "$title" "$titlecol"
+  local inner=$(( h - 1 ))
+
+  # side borders + clear interior
+  local i
+  for ((i=0; i<inner; i++)); do
+    at $((r+1+i)) "$c";          FB+="${FRAME}│${RST}"
+    at $((r+1+i)) "$((c+w-1))";  FB+="${FRAME}│${RST}"
+    at $((r+1+i)) "$((c+1))";    FB+="$(rep $((w-2)) ' ')"
+  done
+
+  # centre the map inside the panel
+  local map_x=$(( c + (w - MAP_W) / 2 ))
+  (( map_x < c+2 )) && map_x=$((c+2))
+  local map_y=$(( r + 1 + (inner - MAP_H - 1) / 2 ))   # leave a row for legend
+  (( map_y < r+1 )) && map_y=$((r+1))
+
+  # Subtle starfield / ocean stipple — purely cosmetic
+  local rr cc dot_chars=('·' ' ' ' ' ' ' '·' ' ' ' ')
+  for ((rr=0; rr<inner-1; rr++)); do
+    at $((r+1+rr)) "$((c+2))"
+    local line="" k
+    for ((k=0; k<w-4; k++)); do
+      local pick=$(( (rr*7 + k*3 + (TICK/8)) % 47 ))
+      if (( pick < 2 )); then line+="${DIM}·${RST}"; else line+=' '; fi
+    done
+    FB+="$line"
+  done
+
+  # base map (cyan / dim)
+  for ((i=0; i<MAP_H && i<inner-1; i++)); do
+    at $((map_y+i)) "$map_x"; FB+="${FRAMEd}${MAP[$i]}${RST}"
+  done
+
+  # radar sweep beam: a single column that travels left-to-right and wraps
+  local beam_col=$(( (TICK / 2) % MAP_W ))
+  local beam_w=2
+  for ((i=0; i<MAP_H && i<inner-1; i++)); do
+    local bx=$(( map_x + beam_col ))
+    (( bx < c+1 || bx >= c+w-1 )) && continue
+    at $((map_y+i)) "$bx"; FB+="${ACC}┊${RST}"
+    bx=$(( bx + 1 ))
+    if (( bx < c+w-1 )); then
+      at $((map_y+i)) "$bx"; FB+="${FRAMEd}┊${RST}"
+    fi
+  done
+
+  # C2 endpoint markers — pinned red; invert/blink on CRITICAL
+  local blink="$CRITc"
+  if [[ "$THREAT" == CRITICAL ]] && (( TICK%2 )); then blink="${INV}${CRITc}"; fi
+  local loc mr mc
+  for loc in "${C2_DOTS[@]}"; do
+    read -r mr mc <<<"$loc"
+    (( mr >= MAP_H || mc >= MAP_W )) && continue
+    at $((map_y+mr)) "$((map_x+mc))"; FB+="${blink}◉${RST}"
+  done
+
+  # rotating repo activity ping (one bright dot every few ticks)
+  local dotc="$OKc"
+  [[ "$THREAT" == ELEVATED ]] && dotc="$WARNc"
+  [[ "$THREAT" == CRITICAL ]] && dotc="$CRITc"
+  local nd=${#REPO_DOTS[@]}
+  if (( nd > 0 )); then
+    local pi=$(( (TICK / 3) % nd ))
+    read -r mr mc <<<"${REPO_DOTS[$pi]}"
+    if (( mr < MAP_H && mc < MAP_W )); then
+      at $((map_y+mr)) "$((map_x+mc))"; FB+="${dotc}●${RST}"
+    fi
+    # a second, dimmer trailing ping
+    local pj=$(( (pi + nd - 1) % nd ))
+    read -r mr mc <<<"${REPO_DOTS[$pj]}"
+    if (( mr < MAP_H && mc < MAP_W )); then
+      at $((map_y+mr)) "$((map_x+mc))"; FB+="${DIM}○${RST}"
+    fi
+  fi
+
+  # CRITICAL: dotted exfil trail from compromised origin → nearest C2
+  if [[ "$THREAT" == CRITICAL && ${#REPO_DOTS[@]} -gt 0 ]]; then
+    read -r mr mc <<<"${REPO_DOTS[0]}"
+    local trail=('·' '·' '─' '─' '◌' '·')
+    local j
+    for ((j=0; j<6; j++)); do
+      local x=$(( map_x + mc + 2 + j*2 ))
+      (( x >= c+w-1 || x >= map_x + MAP_W )) && break
+      at $((map_y+mr)) "$x"
+      FB+="${CRITc}${trail[$(( (TICK+j) % ${#trail[@]} ))]}${RST}"
+    done
+  fi
+
+  # bottom legend line (one row above the box bottom border)
+  local br_t=0 br_d=0
+  [[ -f "$BR_TOTAL_FILE" ]] && br_t=$(cat "$BR_TOTAL_FILE" 2>/dev/null) && br_t=${br_t:-0}
+  [[ -f "$BR_DIRTY_FILE" ]] && br_d=$(cat "$BR_DIRTY_FILE" 2>/dev/null) && br_d=${br_d:-0}
+  local dirty_col="$OKc"; (( br_d > 0 )) && dirty_col="$CRITc"
+  local legend="${CRITc}◉${RST}${TXT} C2  ${OKc}●${RST}${TXT} repo  ${ACC}┊${RST}${TXT} sweep   ${DIM}│${RST}  ${LBL}branches${RST} ${TXT}scanned ${br_t}  ${RST}${dirty_col}dirty ${br_d}${RST}"
+  local lr=$(( r + h - 1 ))
+  at "$lr" "$((c+2))"; FB+="$(rep $((w-4)) ' ')"
+  at "$lr" "$((c+2))"; FB+="$legend"
+
+  box_bot $((r+h)) "$c" "$w" "$titlecol"
 }
 
 draw_feed(){
@@ -781,14 +1071,21 @@ if [[ -n "${SENTINEL_SELFTEST:-}" ]]; then
   printf 'CRIT|Payload signatures|2 file(s) match markers\nOK|Fake font payloads|clear\nOK|VS Code auto-tasks|clear\nCRIT|Propagation droppers|1 temp_auto_push.bat\nOK|Malicious npm dep|clear\nOK|Rogue processes|clear\nWARN|C2 network links|1 link to api.trongrid.io\nOK|Persistence agents|clear\n' >"$L_STATE"
   printf 'idle|%s|%s|\n' "$(now)" "$(( $(now)+97 ))" >"$L_META"
   {
-    printf 'CRIT|sam1am/cairn|FORCE PUSH by mallory|%s\n' "$(now)"
-    printf 'WARN|sam1am/inkit|push by drifter|%s\n' "$(now)"
+    # 6-field rows: CODE|repo|detail|ts|br_total|br_dirty
+    printf 'CRIT|sam1am/cairn|FORCE PUSH by mallory|%s|7|0\n' "$(now)"
+    printf 'CRIT|sam1am/backlogia|1/2 branch(es) infected|%s|2|1\n' "$(now)"
+    printf 'WARN|sam1am/inkit|push by drifter|%s|4|0\n' "$(now)"
     for r in polinrider Sunshine resumaker cocofintel SageChat sidekick pennyQ cli-viz poetroid sekrits; do
-      printf 'OK|sam1am/%s|clean|%s\n' "$r" "$(now)"
+      n=$(( (RANDOM % 6) + 1 ))
+      printf 'OK|sam1am/%s|clean (%sbr)|%s|%s|0\n' "$r" "$n" "$(now)" "$n"
     done
   } >"$R_STATE"
   printf 'idle|%s|%s|\n' "$(now)" "$(( $(now)+212 ))" >"$R_META"
+  # fleet branch totals for the map legend
+  awk -F'|' 'BEGIN{t=0;d=0} {t+=$5;d+=$6} END{print t}' "$R_STATE" >"$BR_TOTAL_FILE"
+  awk -F'|' 'BEGIN{t=0;d=0} {t+=$5;d+=$6} END{print d}' "$R_STATE" >"$BR_DIRTY_FILE"
   emit CRIT "remote:sam1am/cairn" "FORCE PUSH — PolinRider attack signature (actor=mallory)"
+  emit CRIT "remote:sam1am/backlogia#dev" "branch malware — public/fonts/fa-solid-400.woff2"
   emit CRIT "local:prop" "Propagation droppers — 1 temp_auto_push.bat present"
   emit WARN "local:net" "C2 network links — 1 live connection to api.trongrid.io"
   _frames="${SENTINEL_SELFTEST}"
